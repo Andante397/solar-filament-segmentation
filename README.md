@@ -7,8 +7,8 @@ observations, evaluated with Panoptic Quality (PQ) against multiple annotators.
 | | PQ |
 |---|---|
 | Pairwise agreement between human annotators (296 multi-annotator images) | 0.340 |
-| Hysteresis-threshold baseline, 5-fold out-of-fold | TBD |
-| **This solution, 5-fold out-of-fold** | **TBD** |
+| Hysteresis-threshold baseline, 5-fold out-of-fold | 0.432 |
+| **This solution, 5-fold out-of-fold** (95% CI 0.431–0.449) | **0.440** |
 | This solution, public leaderboard | 0.38 |
 
 ## Method
@@ -34,7 +34,7 @@ observations, evaluated with Panoptic Quality (PQ) against multiple annotators.
 ## Reproducing the submission
 
 ```bash
-git clone <this repository> && cd solar-filament-segmentation
+git clone https://github.com/Andante397/solar-filament-segmentation.git && cd solar-filament-segmentation
 pip install -r requirements.txt
 jupyter notebook reproduce_submission.ipynb     # set DATA_ROOT in the first code cell
 ```
@@ -59,6 +59,7 @@ into it and run the notebook; the default `DATA_ROOT` is the Kaggle path.
 | `data/disk_cache_v2.json` | disk centre, radius and limb profile of every competition image |
 | `submission/submission_dl_match.csv` | the submitted predictions |
 | `requirements.txt` | package versions of the environment that produced the submission |
+| `analysis/diagnostics.py` | out-of-fold diagnostics and the figures of the technical report (`analysis/out/`) |
 
 ## Retraining (optional)
 
@@ -80,13 +81,20 @@ python -m filament.decision_layer predict --data-root $DATA
 - When the test set is predicted, the decision threshold is re-chosen so that the mean number
   of emitted instances per test image equals the out-of-fold value (the ensemble average has
   lower peaks than the single-model out-of-fold maps). This uses test images but no test labels.
-- The idea of scoring candidate regions by their expected contribution to PQ follows the
-  public reference solution TBD-CITATION. The feature set, the cross-fitted evaluation and the
-  calibration step are ours.
+- The decision layer follows the public Kaggle notebook *"Deciding under disagreement — a
+  PQ-optimal detect-then-refine cascade for solar filaments (filseg v4)"* shared in this
+  competition: the rule *h·m* > PQ/2, the split into a match probability and a conditional IoU,
+  and the cross-fitted estimation are taken from it. That solution selects candidates from a
+  multi-threshold component tree and adds a detector and a refinement stage; this repository uses
+  a single threshold with connected components, its own feature set and the calibration step
+  described above.
 
 ## Acknowledgements
 
-TBD
+This work uses the MAGFiLO annotations and GONG H-alpha data obtained by the NSO Integrated
+Synoptic Program. SDO/HMI magnetograms (courtesy of NASA/SDO and the HMI science team) were used
+for analysis only. Parts of the source code were written and refactored with the assistance of
+Anthropic's Claude; all results were run and checked by the author.
 
 ## License
 

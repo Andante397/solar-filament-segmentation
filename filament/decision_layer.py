@@ -1,55 +1,54 @@
-"""Decision layer: choose which candidate regions to output so as to maximise PQ.
-
-A candidate is a connected region of the thresholded probability map. The
-competition metric is
-
-    PQ = sum(IoU of matched pairs) / (TP + FP/2 + FN/2),
-
-scored against every annotator reading of an image. Emitting one more
-candidate adds 1/2 to the denominator per reading (it is either a new TP that
-removes an FN, or a new FP) and adds its matched IoU to the numerator. With
-h = P(an annotator drew this object and it matches) and m = E[IoU | matched],
-emitting a candidate raises PQ iff
-
-    u = h * m > PQ / 2.
-
-h and m are estimated from ~20 per-candidate features with two gradient-boosted
-models: a classifier trained on (candidate, reading) pairs and a regressor
-trained on the matched pairs. The threshold tau is tuned on out-of-fold
-predictions and lands at PQ/2 as predicted.
-
-The idea of scoring candidates by expected PQ gain follows the public
-reference solution of this competition (see README); the features,
-cross-fitted evaluation and count-matching calibration are ours.
-
-Because candidates do not overlap, a match at IoU > 0.5 is unique, so whether
-a candidate matches a reading does not depend on which other candidates are
-emitted. PQ of any selection can therefore be computed from per-candidate
-sums in milliseconds, which makes the threshold search and bootstrap cheap.
-
-    python -m filament.decision_layer fit     --data-root <competition folder>
-    python -m filament.decision_layer predict --data-root <competition folder>
 """
-import argparse
-import json
+decision_layer.py —— 轻量版决策层：用学出来的打分器决定输出哪些候选（只用 CPU）
+
+思路
+  现在的规则：一个候选（概率图阈值化后的连通区域）只要 最高概率 > seed_t 且 面积 >= min_area 就输出。
+  这里改成：对每个候选算约 20 个特征，训练两个梯度提升模型
+      h_hat = P(标注员画了它)          （逐"候选 x 标注员"训练的分类器）
+      m_hat = E[IoU | 画了]            （只在匹配上的样本上训练的回归器）
+  输出条件  u_hat = h_hat * m_hat > tau。
+  理论依据：PQ = sum(匹配 IoU) / (TP + FP/2 + FN/2)。多输出一个候选，分母对每个标注员都 +0.5，
+  分子期望 +u，所以当且仅当 u > PQ/2 时输出能让 PQ 变高。tau 在 OOF 上搜索（理论值约 PQ*/2）。
+
+交叉拟合
+  fold k 的候选由"用其他 4 折候选训练的模型"打分，所以 OOF 上的评估是诚实的。
+  测试集用全部 OOF 候选训练的模型打分。
+
+对照
+  在完全相同的候选上，用同一套 PQ 计算评估滞后阈值规则（网格搜索 seed_t、min_area），
+  并做按图像的配对 bootstrap，给出 ΔPQ 的置信区间。
+
+PQ 的快速计算
+  候选互不重叠，IoU>0.5 的匹配是唯一的，所以每个候选对每个标注员是否匹配，与输出了哪些别的候选无关。
+  于是对任意选择 S：  分子 = S 中各候选在各读数上的匹配 IoU 之和
+                       分母 = 0.5 * sum_i R_i*|S_i| + 0.5 * (标注实例总数)
+  可以在几毫秒内评估任意阈值。
+
+用法
+  python decision_layer.py --anno <标注JSON> --disk disk_cache_v2.json --prob-dir ~/probs \
+      --train-img-dir <train_images> --test-img-dir <test_images>
+  第一次运行会把特征缓存到 --cache-dir（默认 dl_cache/），之后重跑只需几十秒。
+  --limit 20 试跑；--mask-t 0.2 0.3 同时试两种候选划分。
+"""
 import os
-import pickle
+import json
 import time
+import pickle
+import argparse
 from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 import scipy.ndimage as ndi
-import sklearn
+from PIL import Image
+from pycocotools.coco import COCO
 from pycocotools import mask as mask_util
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 
-from . import config as C
-from .annotations import Annotations
-from .disk import load_disk_cache, read_gray
-
-MIN_CAND_AREA = 50     # px; smaller regions are never candidates
-RING = 15              # px; width of the annulus used for the local background
+Image.MAX_IMAGE_PIXELS = None
+FULL = 2048
+MIN_CAND_AREA = 50            # 小于这个面积的连通区域不当候选（基线规则的 min_area 网格从 150 起）
+RING = 15                      # 计算"周围亮度"的环宽（px）
 
 FEATURES = ["log_area", "maxp", "meanp", "log_sump", "frac_p05", "frac_p09", "log_core99",
             "elong", "log_length", "width", "bbox_fill", "rho", "abs_y",
@@ -57,116 +56,108 @@ FEATURES = ["log_area", "maxp", "meanp", "log_sump", "frac_p05", "frac_p09", "lo
             "n_cand_img", "log_nn_dist", "area_rank"]
 
 
-# ---------------------------------------------------------------- candidates and features
-def disk_grid(meta):
-    """Pixel coordinates and normalised radius r/R (float32)."""
-    yy, xx = np.mgrid[0:C.FULL, 0:C.FULL].astype(np.float32)
-    rr = np.hypot(xx - meta["cx"], yy - meta["cy"]) / meta["R"]
+# ---------------------------------------------------------------- 图像与几何
+def disk_grid(d):
+    yy, xx = np.mgrid[0:FULL, 0:FULL].astype(np.float32)
+    rr = np.hypot(xx - d["cx"], yy - d["cy"]) / d["R"]
     return xx, yy, rr
 
 
-def contrast_map(img, meta, rr):
-    """Limb-corrected contrast I / F(r) - 1, zero outside the disk."""
-    prof = np.asarray(meta["prof"], np.float32)
+def contrast_map(img, d, rr):
+    """临边校正后的对比度 I / I_clv(r) - 1，用 disk 缓存里的径向中位数廓线（与 notebook 相同）"""
+    prof = np.asarray(d["prof"], np.float32)
     nb = len(prof)
-    flat = np.interp(np.clip(rr * nb, 0, nb - 1), np.arange(nb), prof)
+    idx = np.clip(rr * nb, 0, nb - 1)
+    flat = np.interp(idx, np.arange(nb), prof)
     c = img.astype(np.float32) / np.maximum(flat, 1e-3) - 1.0
-    return np.where(rr < C.DISK_FRAC, c, 0.0).astype(np.float32)
+    return np.where(rr < 0.995, c, 0.0).astype(np.float32)
 
 
-def label_candidates(prob_u8, valid, mask_t):
-    """Connected on-disk regions with probability > mask_t and area >=
-    MIN_CAND_AREA, labelled 1..n in raster order. Returns (labels, n)."""
+# ---------------------------------------------------------------- 候选与特征
+def candidates_and_features(prob_u8, img, d, mask_t):
+    xx, yy, rr = disk_grid(d)
+    valid = rr < 0.995
     lab, n = ndi.label((prob_u8 > int(np.floor(mask_t * 255))) & valid)
     if n == 0:
-        return lab, 0
+        return lab, pd.DataFrame(columns=FEATURES)
     area = np.bincount(lab.ravel(), minlength=n + 1)
     keep = area >= MIN_CAND_AREA
     keep[0] = False
     remap = np.zeros(n + 1, np.int32)
     remap[keep] = np.arange(1, keep.sum() + 1)
-    return remap[lab], int(keep.sum())
-
-
-def candidate_features(prob_u8, img, meta, mask_t):
-    """Label map and one feature row per candidate of an image."""
-    xx, yy, rr = disk_grid(meta)
-    valid = rr < C.DISK_FRAC
-    lab, n = label_candidates(prob_u8, valid, mask_t)
+    lab = remap[lab]
+    n = int(keep.sum())
     if n == 0:
-        return lab, pd.DataFrame(columns=FEATURES + ["area"])
+        return lab, pd.DataFrame(columns=FEATURES)
     L = lab.ravel()
     on = L > 0
     Li = L[on]
     idx = np.arange(1, n + 1)
     p = prob_u8.ravel()[on].astype(np.float32) / 255.0
 
-    def per_cand(w=None):
+    def bc(w=None):
         return np.bincount(Li, weights=w, minlength=n + 1)[1:]
 
-    # probability statistics
-    A = per_cand()
-    sump = per_cand(p)
-    maxp = ndi.maximum(prob_u8, lab, idx).astype(np.float32) / 255.0
-    f05 = per_cand((p > 0.5).astype(np.float32)) / A
-    f09 = per_cand((p > 0.9).astype(np.float32)) / A
-    core = per_cand((p > 0.99).astype(np.float32))
+    A = bc()
+    sump = bc(p)
+    mx = ndi.maximum(prob_u8, lab, idx).astype(np.float32) / 255.0
+    f05 = bc((p > 0.5).astype(np.float32)) / A
+    f09 = bc((p > 0.9).astype(np.float32)) / A
+    core = bc((p > 0.99).astype(np.float32))
 
-    # shape from second moments
-    x, y = xx.ravel()[on], yy.ravel()[on]
-    mx, my = per_cand(x) / A, per_cand(y) / A
-    sxx = per_cand(x * x) / A - mx ** 2
-    syy = per_cand(y * y) / A - my ** 2
-    sxy = per_cand(x * y) / A - mx * my
+    # 形状：二阶矩
+    x = xx.ravel()[on]; y = yy.ravel()[on]
+    mxx, myy = bc(x) / A, bc(y) / A
+    sxx = bc(x * x) / A - mxx ** 2
+    syy = bc(y * y) / A - myy ** 2
+    sxy = bc(x * y) / A - mxx * myy
     tr, det = sxx + syy, sxx * syy - sxy ** 2
     disc = np.sqrt(np.maximum(tr ** 2 / 4 - det, 0))
     l1, l2 = tr / 2 + disc, np.maximum(tr / 2 - disc, 1e-3)
-    length = 4 * np.sqrt(np.maximum(l1, 1e-3))   # ~ length of a thin uniform strip
-    boxes = ndi.find_objects(lab)
-    bbox_area = np.array([(s[0].stop - s[0].start) * (s[1].stop - s[1].start) for s in boxes],
-                         np.float32)
+    length = 4 * np.sqrt(np.maximum(l1, 1e-3))          # 均匀细条的长度 ≈ sqrt(12*l1)，量级一致即可
+    sl = ndi.find_objects(lab)
+    bbox_area = np.array([(s[0].stop - s[0].start) * (s[1].stop - s[1].start) for s in sl], np.float32)
 
-    # position on the disk
-    rho = np.hypot(mx - meta["cx"], my - meta["cy"]) / meta["R"]
-    abs_y = np.abs(my - meta["cy"]) / meta["R"]   # solar north is up: proxy for |latitude|
+    # 位置
+    rho = np.hypot(mxx - d["cx"], myy - d["cy"]) / d["R"]
+    abs_y = np.abs(myy - d["cy"]) / d["R"]               # 图像北在上，|Y| 是纬度的近似
 
-    # image contrast inside the candidate and in a surrounding annulus
-    con = contrast_map(img, meta, rr)
-    con_mean = per_cand(con.ravel()[on]) / A
+    # 图像：对比度、环形背景
+    con = contrast_map(img, d, rr)
+    cv = con.ravel()[on]
+    con_mean = bc(cv) / A
     con_min = ndi.minimum(con, lab, idx).astype(np.float32)
     dil = ndi.grey_dilation(lab, size=(2 * RING + 1, 2 * RING + 1))
     ring = (dil > 0) & (lab == 0) & valid
-    ring_lab = dil[ring]
-    ring_n = np.bincount(ring_lab, minlength=n + 1)[1:]
-    ring_s = np.bincount(ring_lab, weights=con[ring], minlength=n + 1)[1:]
+    rl = dil[ring]
+    ring_n = np.bincount(rl, minlength=n + 1)[1:]
+    ring_s = np.bincount(rl, weights=con[ring], minlength=n + 1)[1:]
     con_ring = np.where(ring_n > 0, ring_s / np.maximum(ring_n, 1), 0.0)
-    disk_median = float(np.median(img[valid])) if valid.any() else 1.0
-    inten_rel = (per_cand(img.ravel()[on].astype(np.float32)) / A) / max(disk_median, 1.0)
+    disk_med = float(np.median(img[valid])) if valid.any() else 1.0
+    inten_rel = (bc(img.ravel()[on].astype(np.float32)) / A) / max(disk_med, 1.0)
 
-    # context: other candidates in the same image
+    # 上下文
+    cxy = np.c_[mxx, myy]
     if n > 1:
-        dd = np.hypot(mx[:, None] - mx[None, :], my[:, None] - my[None, :])
+        dd = np.hypot(cxy[:, None, 0] - cxy[None, :, 0], cxy[:, None, 1] - cxy[None, :, 1])
         np.fill_diagonal(dd, np.inf)
-        nn_dist = dd.min(1)
+        nn = dd.min(1)
     else:
-        nn_dist = np.full(n, 3000.0)
-    area_rank = (np.argsort(np.argsort(-A)) + 1) / n
+        nn = np.full(n, 3000.0)
+    rank = (np.argsort(np.argsort(-A)) + 1) / n
 
     df = pd.DataFrame(dict(
-        log_area=np.log(A), maxp=maxp, meanp=sump / A, log_sump=np.log1p(sump),
-        frac_p05=f05, frac_p09=f09, log_core99=np.log1p(core),
-        elong=np.sqrt(l1 / l2), log_length=np.log(length), width=A / length,
+        log_area=np.log(A), maxp=mx, meanp=sump / A, log_sump=np.log1p(sump), frac_p05=f05, frac_p09=f09,
+        log_core99=np.log1p(core), elong=np.sqrt(l1 / l2), log_length=np.log(length), width=A / length,
         bbox_fill=A / np.maximum(bbox_area, 1), rho=rho, abs_y=abs_y,
         con_mean=con_mean, con_min=con_min, con_ring=con_ring, con_diff=con_mean - con_ring,
-        inten_rel=inten_rel, n_cand_img=np.full(n, n, np.float32),
-        log_nn_dist=np.log1p(nn_dist), area_rank=area_rank))
+        inten_rel=inten_rel, n_cand_img=np.full(n, n, np.float32), log_nn_dist=np.log1p(nn), area_rank=rank))
     df["area"] = A
     return lab, df
 
 
 def match_ious(lab, n, gt_masks):
-    """Matched IoU of every candidate against one reading (0 if unmatched).
-    A match requires IoU > 0.5, which makes it unique."""
+    """每个候选在这一个读数里的匹配 IoU（>0.5 才算，否则 0）。候选互不重叠，匹配唯一。"""
     out = np.zeros(n, np.float32)
     if n == 0:
         return out
@@ -180,322 +171,271 @@ def match_ious(lab, n, gt_masks):
     return out
 
 
-# ---------------------------------------------------------------- feature tables
-def _fold_files(paths, split):
-    return [paths.prob(split, k) for k in range(C.N_FOLDS) if os.path.exists(paths.prob(split, k))]
-
-
-def build_oof_table(paths, mask_t, limit=0):
-    """Candidates of all out-of-fold training images with their features and
-    their matched IoU against every reading. Returns (table, image info)."""
-    ann = Annotations(paths.annotations)
-    disk = load_disk_cache(paths.disk_cache)
+# ---------------------------------------------------------------- 构建 OOF / 测试特征表（带缓存）
+def build_oof(args, coco, readings, DISK, mask_t):
+    path = os.path.join(args.cache_dir, f"oof_mt{mask_t}_lim{args.limit}.pkl")
+    if os.path.exists(path):
+        return pickle.load(open(path, "rb"))
     rows, imgs, t0 = [], {}, time.time()
-    for k in range(C.N_FOLDS):
-        if not os.path.exists(paths.prob("val", k)):
+    for k in range(5):
+        f = os.path.join(args.prob_dir, f"val_prob_fold{k}.npz")
+        if not os.path.exists(f):
             continue
-        z = np.load(paths.prob("val", k))
-        names = [n for n in z.files if n in disk and n in ann.readings_of]
-        for name in (names[:limit] if limit else names):
-            img = read_gray(os.path.join(paths.train_images, name))
-            lab, df = candidate_features(z[name], img, disk[name], mask_t)
+        z = np.load(f)
+        names = [n for n in z.files if n in DISK and n in readings]
+        if args.limit:
+            names = names[:args.limit]
+        for fn in names:
+            img = np.asarray(Image.open(os.path.join(args.train_img_dir, fn)).convert("L"))
+            lab, df = candidates_and_features(z[fn], img, DISK[fn], mask_t)
             n = len(df)
-            gts = [ann.instance_masks(iid) for iid in ann.readings_of[name]]
+            gts = []
+            for iid in readings[fn]:
+                gts.append([coco.annToMask(a).astype(bool) for a in coco.loadAnns(coco.getAnnIds(imgIds=[iid]))])
             R = len(gts)
-            iou = (np.stack([match_ious(lab, n, g) for g in gts], 1) if n
-                   else np.zeros((0, R), np.float32))
-            df["obs"], df["fold"], df["R"] = name, k, R
-            df["iou_sum"] = iou.sum(1)            # summed over readings
-            df["h"] = (iou > 0).mean(1)           # fraction of readings that match
-            df["iou_rows"] = list(iou)
+            I = np.stack([match_ious(lab, n, g) for g in gts], 1) if n else np.zeros((0, R), np.float32)
+            df["obs"], df["fold"], df["R"] = fn, k, R
+            df["iou_sum"] = I.sum(1)                       # 各读数匹配 IoU 之和
+            df["h"] = (I > 0).mean(1)                      # 被画出的比例
+            df["iou_rows"] = list(I)
             rows.append(df)
-            imgs[name] = dict(fold=k, R=R, n_gt=sum(len(g) for g in gts))
-            if len(imgs) % 50 == 0:
-                print(f"  OOF features: {len(imgs)} images ({time.time() - t0:.0f}s)", flush=True)
-    table = pd.concat(rows, ignore_index=True)
-    print(f"OOF candidates: {len(table)} in {len(imgs)} images ({time.time() - t0:.0f}s)")
-    return table, imgs
+            imgs[fn] = dict(fold=k, R=R, n_gt=sum(len(g) for g in gts))
+            if len(imgs) % 25 == 0:
+                print(f"  OOF 特征 {len(imgs)} 张 ({time.time()-t0:.0f}s)", flush=True)
+    data = (pd.concat(rows, ignore_index=True), imgs)
+    os.makedirs(args.cache_dir, exist_ok=True)
+    pickle.dump(data, open(path, "wb"))
+    print(f"OOF 候选 {len(data[0])} 个 / {len(imgs)} 张图，{time.time()-t0:.0f}s，已缓存 {path}")
+    return data
 
 
-def ensemble_prob(archives, name):
-    """Mean of the fold models' uint8 probability maps, rounded to uint8."""
-    acc = np.zeros((C.FULL, C.FULL), np.float32)
-    for z in archives:
-        acc += z[name]
-    return np.clip(acc / len(archives) + 0.5, 0, 255).astype(np.uint8)
+def ensemble_prob(zs, fn):
+    acc = np.zeros((FULL, FULL), np.float32)
+    for z in zs:
+        acc += z[fn]
+    return np.clip(acc / len(zs) + 0.5, 0, 255).astype(np.uint8)
 
 
-def build_test_table(paths, mask_t):
-    """Candidates and features of the test images from the fold ensemble."""
-    disk = load_disk_cache(paths.disk_cache)
-    archives = [np.load(f) for f in _fold_files(paths, "test")]
-    if not archives:
-        raise FileNotFoundError(f"no test_prob_fold*.npz in {paths.work_dir}")
-    names = sorted(set(archives[0].files).intersection(*[set(z.files) for z in archives[1:]]))
+def build_test(args, DISK, mask_t):
+    path = os.path.join(args.cache_dir, f"test_mt{mask_t}.pkl")
+    if os.path.exists(path):
+        return pickle.load(open(path, "rb"))
+    zs = [np.load(os.path.join(args.prob_dir, f"test_prob_fold{k}.npz")) for k in range(5)
+          if os.path.exists(os.path.join(args.prob_dir, f"test_prob_fold{k}.npz"))]
+    names = sorted(set(zs[0].files).intersection(*[set(z.files) for z in zs[1:]]))
     rows, t0 = [], time.time()
-    for i, name in enumerate(names):
-        img = read_gray(os.path.join(paths.test_images, name))
-        _, df = candidate_features(ensemble_prob(archives, name), img, disk[name], mask_t)
-        df["obs"] = name
+    for i, fn in enumerate(names):
+        img = np.asarray(Image.open(os.path.join(args.test_img_dir, fn)).convert("L"))
+        prob = ensemble_prob(zs, fn)
+        lab, df = candidates_and_features(prob, img, DISK[fn], mask_t)
+        df["obs"] = fn
         df["cand_id"] = np.arange(1, len(df) + 1)
         rows.append(df)
-        if (i + 1) % 60 == 0:
-            print(f"  test features: {i + 1}/{len(names)} ({time.time() - t0:.0f}s)", flush=True)
-    return pd.concat(rows, ignore_index=True), names, archives
+        if (i + 1) % 30 == 0:
+            print(f"  测试特征 {i+1}/{len(names)} ({time.time()-t0:.0f}s)", flush=True)
+    data = (pd.concat(rows, ignore_index=True), names, len(zs))
+    pickle.dump(data, open(path, "wb"))
+    return data
 
 
-# ---------------------------------------------------------------- scorer
-def fit_scorer(table, seed=0):
-    """Classifier for h (one row per candidate x reading) and regressor for m
-    (matched rows only)."""
-    X = table[FEATURES].to_numpy(np.float32)
-    r_max = int(table["R"].max())
-    iou = np.stack(table["iou_rows"].map(lambda a: np.pad(a, (0, r_max - len(a)))).to_list())
-    n_read = table["R"].to_numpy()
-    rep = np.concatenate([np.repeat(i, r) for i, r in enumerate(n_read)])
-    col = np.concatenate([np.arange(r) for r in n_read])
-    y_iou = iou[rep, col]
+# ---------------------------------------------------------------- 打分器
+def fit_scorer(df, seed=0):
+    """h 分类器：每个 (候选, 读数) 一行；m 回归器：只用匹配上的行"""
+    X = df[FEATURES].to_numpy(np.float32)
+    Rmax = int(df["R"].max())
+    I = np.stack(df["iou_rows"].map(lambda a: np.pad(a, (0, Rmax - len(a)))).to_list())
+    Rs = df["R"].to_numpy()
+    rep = np.concatenate([np.repeat(i, r) for i, r in enumerate(Rs)])
+    col = np.concatenate([np.arange(r) for r in Rs])
+    y_iou = I[rep, col]
     Xr = X[rep]
     clf = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
-                                         min_samples_leaf=40, l2_regularization=1.0,
-                                         random_state=seed)
+                                         min_samples_leaf=40, l2_regularization=1.0, random_state=seed)
     clf.fit(Xr, (y_iou > 0).astype(int))
-    matched = y_iou > 0
+    m = y_iou > 0
     reg = HistGradientBoostingRegressor(max_iter=200, learning_rate=0.05, max_leaf_nodes=31,
-                                        min_samples_leaf=40, l2_regularization=1.0,
-                                        random_state=seed)
-    reg.fit(Xr[matched], y_iou[matched])
+                                        min_samples_leaf=40, l2_regularization=1.0, random_state=seed)
+    reg.fit(Xr[m], y_iou[m])
     return clf, reg
 
 
-def score(models, table):
-    """(h, m, u = h * m) for every candidate."""
+def score(models, df):
     clf, reg = models
-    if len(table) == 0:
+    if len(df) == 0:
         z = np.zeros(0)
         return z, z, z
-    X = table[FEATURES].to_numpy(np.float32)
+    X = df[FEATURES].to_numpy(np.float32)
     h = clf.predict_proba(X)[:, 1]
-    m = np.clip(reg.predict(X), 0.5, 1.0)
-    return h, m, h * m
+    mm = np.clip(reg.predict(X), 0.5, 1.0)
+    return h, mm, h * mm
 
 
-def cross_fit(table):
-    """Out-of-fold scores: candidates of fold k are scored by models fitted on
-    the other folds. Adds the columns h_hat, m_hat and u_hat."""
-    u, h, m = np.zeros(len(table)), np.zeros(len(table)), np.zeros(len(table))
-    for k in sorted(table["fold"].unique()):
-        train, test = table["fold"] != k, (table["fold"] == k).to_numpy()
-        h[test], m[test], u[test] = score(fit_scorer(table[train]), table[test])
-    return table.assign(u_hat=u, h_hat=h, m_hat=m)
-
-
-# ---------------------------------------------------------------- fast PQ and bootstrap
-def per_image_terms(table, selected, imgs):
-    """(numerator, denominator) of PQ contributed by each image."""
-    g = table.assign(_num=np.where(selected, table["iou_sum"], 0.0),
-                     _k=selected.astype(int)).groupby("obs")
-    num, k = g["_num"].sum(), g["_k"].sum()
-    return {name: (float(num.get(name, 0.0)),
-                   0.5 * info["R"] * int(k.get(name, 0)) + 0.5 * info["n_gt"])
-            for name, info in imgs.items()}
-
-
-def pq_from(terms, keys=None):
-    keys = keys if keys is not None else list(terms)
-    num = sum(terms[k][0] for k in keys)
-    den = sum(terms[k][1] for k in keys)
-    return num / den if den else 0.0
-
-
-def paired_bootstrap(terms_a, terms_b, n_boot=2000, seed=0):
-    """95 % CI of PQ(b) - PQ(a), resampling images, and P(difference <= 0)."""
-    keys = list(terms_a)
-    na = np.array([terms_a[k][0] for k in keys]); da = np.array([terms_a[k][1] for k in keys])
-    nb = np.array([terms_b[k][0] for k in keys]); db = np.array([terms_b[k][1] for k in keys])
-    rng = np.random.default_rng(seed)
-    diff = np.empty(n_boot)
-    for b in range(n_boot):
-        i = rng.integers(0, len(keys), len(keys))
-        diff[b] = nb[i].sum() / db[i].sum() - na[i].sum() / da[i].sum()
-    return np.percentile(diff, [2.5, 97.5]), float((diff <= 0).mean())
-
-
-# ---------------------------------------------------------------- fit
-def fit(paths, model_dir, mask_t=0.3, limit=0):
-    """Cross-fitted evaluation on out-of-fold candidates, then the final scorer.
-
-    Candidates of fold k are scored by models trained on the other folds, so
-    the reported PQ is honest. The hysteresis-threshold baseline (emit iff max
-    probability > seed_t and area >= min_area) is evaluated on the same
-    candidates. Writes scorer.pkl and decision_layer_params.json."""
-    table, imgs = build_oof_table(paths, mask_t, limit)
-    folds = sorted(table["fold"].unique())
-
-    best = (-1.0, None, None)
-    for seed_t in [0.90, 0.95, 0.97, 0.98, 0.99, 0.995]:
-        for min_area in [150, 300, 500, 800]:
-            sel = ((table["maxp"] > np.floor(seed_t * 255) / 255)
-                   & (table["area"] >= min_area)).to_numpy()
-            pq = pq_from(per_image_terms(table, sel, imgs))
-            if pq > best[0]:
-                best = (pq, (seed_t, min_area), sel)
-    base_pq, (seed_t, min_area), base_sel = best
-    print(f"baseline (hysteresis): seed_t={seed_t}, min_area={min_area} -> OOF PQ {base_pq:.4f}")
-
-    table = cross_fit(table)
-
-    taus = np.round(np.arange(0.05, 0.60, 0.01), 3)
-    curve = [(t, pq_from(per_image_terms(table, (table["u_hat"] > t).to_numpy(), imgs)))
-             for t in taus]
-    tau, dl_pq = max(curve, key=lambda c: c[1])
-    dl_sel = (table["u_hat"] > tau).to_numpy()
-    print(f"decision layer: tau={tau} -> OOF PQ {dl_pq:.4f}   (theory: PQ/2 = {dl_pq / 2:.3f})")
-
-    terms_a = per_image_terms(table, base_sel, imgs)
-    terms_b = per_image_terms(table, dl_sel, imgs)
-    ci, p_le0 = paired_bootstrap(terms_a, terms_b)
-    print(f"delta PQ = {dl_pq - base_pq:+.4f}   paired bootstrap 95% CI "
-          f"[{ci[0]:+.4f}, {ci[1]:+.4f}]   P(delta<=0) = {p_le0:.3f}")
-    per_fold = {}
-    print("per fold (baseline -> decision layer):")
-    for k in folds:
-        keys = [n for n, info in imgs.items() if info["fold"] == k]
-        per_fold[int(k)] = (pq_from(terms_a, keys), pq_from(terms_b, keys))
-        print(f"  fold {k}: {per_fold[int(k)][0]:.4f} -> {per_fold[int(k)][1]:.4f}")
-    per_image = dl_sel.sum() / len(imgs)
-    print(f"instances per image: baseline {base_sel.sum() / len(imgs):.2f} | "
-          f"decision layer {per_image:.2f}")
-
-    bins = pd.cut(table["h_hat"], [0, .1, .2, .3, .5, .7, .9, 1.0], include_lowest=True)
-    cal = table.groupby(bins, observed=True).agg(n=("h", "size"), predicted=("h_hat", "mean"),
-                                                observed=("h", "mean"))
-    print("calibration of h (predicted vs observed match rate):\n" + cal.round(3).to_string())
-
-    os.makedirs(model_dir, exist_ok=True)
-    with open(os.path.join(model_dir, "scorer.pkl"), "wb") as f:
-        pickle.dump(fit_scorer(table), f)         # final scorer: all OOF candidates
-    params = dict(
-        mask_t=mask_t, tau=float(tau), instances_per_image=float(per_image),
-        oof_pq=float(dl_pq), baseline_pq=float(base_pq), baseline_seed_t=seed_t,
-        baseline_min_area=min_area, delta_ci95=[float(ci[0]), float(ci[1])],
-        per_fold={k: [float(a), float(b)] for k, (a, b) in per_fold.items()},
-        tau_curve=[[float(t), float(p)] for t, p in curve],
-        n_images=len(imgs), n_candidates=len(table), features=FEATURES,
-        sklearn_version=sklearn.__version__)
-    with open(os.path.join(model_dir, "decision_layer_params.json"), "w") as f:
-        json.dump(params, f, indent=2)
-    print(f"saved scorer and parameters to {model_dir}/")
-    return params
-
-
-# ---------------------------------------------------------------- predict
-def load_scorer(model_dir):
-    with open(os.path.join(model_dir, "decision_layer_params.json")) as f:
-        params = json.load(f)
-    if params["sklearn_version"] != sklearn.__version__:
-        print(f"WARNING: scorer was fitted with scikit-learn {params['sklearn_version']}, "
-              f"running {sklearn.__version__}; install the pinned version to reproduce exactly")
-    with open(os.path.join(model_dir, "scorer.pkl"), "rb") as f:
-        return pickle.load(f), params
-
-
-def predict(paths, model_dir, out_csv, calibrate=True):
-    """Score the test candidates and write the submission file.
-
-    The out-of-fold probability maps come from single models, the test maps
-    from a 5-model average, whose peaks are lower. This shifts the scorer's
-    inputs, so with `calibrate` the threshold is re-chosen such that the mean
-    number of emitted instances per test image equals the out-of-fold value.
-    No test labels are involved."""
-    models, params = load_scorer(model_dir)
-    mask_t, tau = params["mask_t"], params["tau"]
-    table, names, archives = build_test_table(paths, mask_t)
-    table = table.assign(u_hat=score(models, table)[2])
-    if calibrate and len(archives) > 1:
-        grid = np.round(np.arange(0.02, 0.70, 0.005), 3)
-        count = np.array([(table["u_hat"] > t).sum() / len(names) for t in grid])
-        tau = float(grid[np.argmin(np.abs(count - params["instances_per_image"]))])
-    print(f"tau: {params['tau']} out-of-fold ({params['instances_per_image']:.2f} instances/image)"
-          f" -> {tau:.3f} on test ({(table['u_hat'] > tau).sum() / len(names):.2f}/image)")
-
-    disk = load_disk_cache(paths.disk_cache)
-    rows = []
-    for name in names:
-        keep = table[(table["obs"] == name) & (table["u_hat"] > tau)]["cand_id"].to_numpy()
-        if len(keep) == 0:
-            continue
-        valid = disk_grid(disk[name])[2] < C.DISK_FRAC
-        lab, _ = label_candidates(ensemble_prob(archives, name), valid, mask_t)
-        stem = os.path.splitext(name)[0]
-        for j, cand in enumerate(keep, 1):
-            counts = mask_util.encode(np.asfortranarray((lab == cand).astype(np.uint8)))["counts"]
-            rows.append({"filament_id": f"{stem}_{j}",
-                         "segmentation_rle": counts.decode() if isinstance(counts, bytes) else counts})
-    sub = pd.DataFrame(rows, columns=["filament_id", "segmentation_rle"])
-    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
-    sub.to_csv(out_csv, index=False)
-    problems = check_submission(out_csv)
-    print(f"wrote {out_csv}: {len(sub)} instances in {len(names)} images | "
-          f"format check {'passed' if problems == 0 else f'FAILED ({problems})'}")
-    return sub
-
-
-def decode_submission(path):
-    """{image stem: [boolean masks]} from a submission CSV."""
-    sub = pd.read_csv(path)
-    out = defaultdict(list)
-    for fid, counts in zip(sub["filament_id"], sub["segmentation_rle"]):
-        m = mask_util.decode({"size": [C.FULL, C.FULL], "counts": counts.encode()})
-        out[fid.rsplit("_", 1)[0]].append(m.astype(bool))
+# ---------------------------------------------------------------- PQ（快速）与配对 bootstrap
+def per_image(df, sel, imgs):
+    """每张图的 (分子, 分母)"""
+    g = df.assign(_num=np.where(sel, df["iou_sum"], 0.0), _k=sel.astype(int)).groupby("obs")
+    num = g["_num"].sum(); k = g["_k"].sum()
+    out = {}
+    for fn, info in imgs.items():
+        kk = int(k.get(fn, 0))
+        out[fn] = (float(num.get(fn, 0.0)), 0.5 * info["R"] * kk + 0.5 * info["n_gt"])
     return out
 
 
-def check_submission(path):
-    """Number of format problems: duplicate ids, empty or overlapping masks."""
-    problems = int(not pd.read_csv(path)["filament_id"].is_unique)
-    for masks in decode_submission(path).values():
-        problems += sum(int(m.sum() == 0) for m in masks)
-        problems += int(np.sum(masks, axis=0).max() > 1)
-    return problems
+def pq_from(pi, keys=None):
+    keys = keys if keys is not None else list(pi)
+    n = sum(pi[k][0] for k in keys); d = sum(pi[k][1] for k in keys)
+    return n / d if d else 0.0
 
 
-def compare_submissions(path_a, path_b):
-    """Summary of the differences between two submission files."""
-    a, b = decode_submission(path_a), decode_submission(path_b)
-    n_a, n_b = sum(map(len, a.values())), sum(map(len, b.values()))
-    identical, differing_pixels = 0, 0
-    for stem in set(a) | set(b):
-        ua = np.any(a.get(stem, [np.zeros((C.FULL, C.FULL), bool)]), axis=0)
-        ub = np.any(b.get(stem, [np.zeros((C.FULL, C.FULL), bool)]), axis=0)
-        differing_pixels += int((ua ^ ub).sum())
-        keys_b = {m.tobytes() for m in b.get(stem, [])}
-        identical += sum(m.tobytes() in keys_b for m in a.get(stem, []))
-    with open(path_a, "rb") as fa, open(path_b, "rb") as fb:
-        same_bytes = fa.read() == fb.read()
-    return dict(byte_identical=same_bytes, instances_a=n_a, instances_b=n_b,
-                identical_instances=identical, differing_pixels=differing_pixels)
+def paired_boot(pa, pb, B=2000, seed=0):
+    keys = np.array(list(pa))
+    na = np.array([pa[k][0] for k in keys]); da = np.array([pa[k][1] for k in keys])
+    nb = np.array([pb[k][0] for k in keys]); db = np.array([pb[k][1] for k in keys])
+    rng = np.random.default_rng(seed)
+    out = np.empty(B)
+    for b in range(B):
+        i = rng.integers(0, len(keys), len(keys))
+        out[b] = nb[i].sum() / db[i].sum() - na[i].sum() / da[i].sum()
+    return np.percentile(out, [2.5, 97.5]), float((out <= 0).mean())
+
+
+# ---------------------------------------------------------------- 主流程
+def run_one(args, coco, readings, DISK, mask_t):
+    print("\n" + "=" * 76 + f"\n候选划分 mask_t = {mask_t}\n" + "=" * 76)
+    df, imgs = build_oof(args, coco, readings, DISK, mask_t)
+    folds = sorted(df["fold"].unique())
+
+    # 基线：滞后阈值规则，在同一批候选上网格搜索
+    best_base = (-1, None)
+    for st in [0.90, 0.95, 0.97, 0.98, 0.99, 0.995]:
+        for ma in [150, 300, 500, 800]:
+            sel = ((df["maxp"] > np.floor(st * 255) / 255) & (df["area"] >= ma)).to_numpy()
+            pq = pq_from(per_image(df, sel, imgs))
+            if pq > best_base[0]:
+                best_base = (pq, (st, ma), sel)
+    base_pq, (st, ma), base_sel = best_base
+    print(f"基线（滞后阈值）: seed_t={st}, min_area={ma} -> OOF PQ {base_pq:.4f}")
+
+    # 交叉拟合
+    u = np.zeros(len(df)); h = np.zeros(len(df)); mm = np.zeros(len(df))
+    for k in folds:
+        tr, te = df["fold"] != k, df["fold"] == k
+        models = fit_scorer(df[tr])
+        h[te.to_numpy()], mm[te.to_numpy()], u[te.to_numpy()] = score(models, df[te])
+    df = df.assign(u_hat=u, h_hat=h, m_hat=mm)
+
+    taus = np.round(np.arange(0.05, 0.60, 0.01), 3)
+    curve = [(t, pq_from(per_image(df, (df["u_hat"] > t).to_numpy(), imgs))) for t in taus]
+    tau, dl_pq = max(curve, key=lambda c: c[1])
+    dl_sel = (df["u_hat"] > tau).to_numpy()
+    print(f"决策层: tau={tau} -> OOF PQ {dl_pq:.4f}   （理论 tau ≈ PQ/2 = {dl_pq/2:.3f}）")
+
+    pa, pb = per_image(df, base_sel, imgs), per_image(df, dl_sel, imgs)
+    ci, p_le0 = paired_boot(pa, pb)
+    print(f"ΔPQ = {dl_pq - base_pq:+.4f}   配对 bootstrap 95% CI [{ci[0]:+.4f}, {ci[1]:+.4f}]   P(Δ<=0) = {p_le0:.3f}")
+    print("各折 PQ（基线 -> 决策层）:")
+    for k in folds:
+        ks = [fn for fn, inf in imgs.items() if inf["fold"] == k]
+        print(f"  fold {k}: {pq_from(pa, ks):.4f} -> {pq_from(pb, ks):.4f}")
+    print(f"平均每图输出实例数: 基线 {base_sel.sum()/len(imgs):.2f} | 决策层 {dl_sel.sum()/len(imgs):.2f}")
+    print("tau 曲线（每 0.05）: " + "  ".join(f"{t:.2f}:{p:.4f}" for t, p in curve if abs(t * 20 - round(t * 20)) < 1e-6))
+
+    # 校准检查：按 h_hat 分箱，预测 vs 实际
+    bins = pd.cut(df["h_hat"], [0, .1, .2, .3, .5, .7, .9, 1.0], include_lowest=True)
+    cal = df.groupby(bins, observed=True).agg(n=("h", "size"), h_pred=("h_hat", "mean"), h_true=("h", "mean"))
+    print("h_hat 校准（预测 vs 实际被画出的比例）:\n" + cal.round(3).to_string())
+    return dict(mask_t=mask_t, df=df, imgs=imgs, base=(base_pq, st, ma), dl=(dl_pq, tau))
+
+
+def write_submission(args, DISK, res, mode):
+    mask_t, (dl_pq, tau) = res["mask_t"], res["dl"]
+    df = res["df"]
+    models = fit_scorer(df)                                 # 全部 OOF 候选训练
+    tdf, names, n_models = build_test(args, DISK, mask_t)
+    _, _, ut = score(models, tdf)
+    tdf = tdf.assign(u_hat=ut)
+    target = (df["u_hat"] > tau).sum() / len(res["imgs"])
+    tau_use = tau
+    if mode == "match" and n_models > 1:
+        # 集成概率图的峰值被平均压低，打分器的输入分布会偏移；按"每图实例数与 OOF 一致"重新选 tau
+        grid = np.round(np.arange(0.02, 0.70, 0.005), 3)
+        cnt = np.array([(tdf["u_hat"] > t).sum() / len(names) for t in grid])
+        tau_use = float(grid[np.argmin(np.abs(cnt - target))])
+    print(f"\n[{mode}] OOF tau={tau}（每图 {target:.2f} 个）-> 测试集用 tau={tau_use:.3f}"
+          f"（每图 {(tdf['u_hat'] > tau_use).sum()/len(names):.2f} 个）")
+
+    zs = [np.load(os.path.join(args.prob_dir, f"test_prob_fold{k}.npz")) for k in range(5)
+          if os.path.exists(os.path.join(args.prob_dir, f"test_prob_fold{k}.npz"))]
+    out_rows = []
+    for fn in names:
+        keep = tdf[(tdf["obs"] == fn) & (tdf["u_hat"] > tau_use)]["cand_id"].to_numpy()
+        if len(keep) == 0:
+            continue
+        d = DISK[fn]
+        yy, xx = np.ogrid[0:FULL, 0:FULL]
+        valid = (xx - d["cx"]) ** 2 + (yy - d["cy"]) ** 2 < (0.995 * d["R"]) ** 2
+        prob = ensemble_prob(zs, fn)
+        lab, n = ndi.label((prob > int(np.floor(mask_t * 255))) & valid)
+        area = np.bincount(lab.ravel(), minlength=n + 1)
+        k_ = area >= MIN_CAND_AREA; k_[0] = False
+        remap = np.zeros(n + 1, np.int32); remap[k_] = np.arange(1, k_.sum() + 1)
+        lab = remap[lab]                                    # 与特征计算时完全相同的编号
+        stem = os.path.splitext(fn)[0]
+        for j, cid in enumerate(keep, 1):
+            c = mask_util.encode(np.asfortranarray((lab == cid).astype(np.uint8)))["counts"]
+            out_rows.append({"filament_id": f"{stem}_{j}", "segmentation_rle": c.decode() if isinstance(c, bytes) else c})
+    path = os.path.join(args.out_dir, f"submission_dl_{mode}.csv")
+    sub = pd.DataFrame(out_rows, columns=["filament_id", "segmentation_rle"])
+    sub.to_csv(path, index=False)
+    # 自检
+    chk = pd.read_csv(path)
+    assert chk.filament_id.is_unique
+    bad, per = 0, defaultdict(list)
+    for fid, c in zip(chk.filament_id, chk.segmentation_rle):
+        per[fid.rsplit("_", 1)[0]].append(c)
+    for _, cs in per.items():
+        acc = np.zeros((FULL, FULL), np.uint8)
+        for c in cs:
+            m = mask_util.decode({"size": [FULL, FULL], "counts": c.encode()})
+            bad += int(m.sum() == 0); acc += m
+        bad += int(acc.max() > 1)
+    print(f"已写入 {path}: {len(sub)} 个实例 / {len(names)} 张图 | 自检 {'通过' if bad == 0 else f'{bad} 处异常'}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["fit", "predict"])
-    ap.add_argument("--data-root", required=True)
-    ap.add_argument("--work-dir", default="output", help="folder with *_prob_fold*.npz")
-    ap.add_argument("--disk-cache", default="data/disk_cache_v2.json")
-    ap.add_argument("--model-dir", default="models")
-    ap.add_argument("--mask-t", type=float, default=0.3, help="candidate threshold (fit)")
-    ap.add_argument("--limit", type=int, default=0, help="first N images per fold (fit, smoke test)")
-    ap.add_argument("--out", default="output/submission.csv")
-    ap.add_argument("--no-calibrate", action="store_true",
-                    help="use the out-of-fold tau unchanged (predict)")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--anno", required=True)
+    ap.add_argument("--disk", required=True)
+    ap.add_argument("--prob-dir", required=True)
+    ap.add_argument("--train-img-dir", required=True)
+    ap.add_argument("--test-img-dir", default=None)
+    ap.add_argument("--mask-t", type=float, nargs="+", default=[0.3])
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--cache-dir", default="dl_cache")
+    ap.add_argument("--out-dir", default=".")
+    ap.add_argument("--no-submission", action="store_true")
     args = ap.parse_args()
-    paths = C.Paths(args.data_root, work_dir=args.work_dir, disk_cache=args.disk_cache)
-    if args.command == "fit":
-        fit(paths, args.model_dir, args.mask_t, args.limit)
-    else:
-        predict(paths, args.model_dir, args.out, calibrate=not args.no_calibrate)
+
+    DISK = json.load(open(args.disk))
+    coco = COCO(args.anno)
+    readings = defaultdict(list)
+    for iid in coco.getImgIds():
+        readings[coco.loadImgs([iid])[0]["file_name"]].append(iid)
+
+    results = [run_one(args, coco, readings, DISK, mt) for mt in args.mask_t]
+    best = max(results, key=lambda r: r["dl"][0])
+    print("\n" + "=" * 76)
+    for r in results:
+        print(f"mask_t={r['mask_t']}: 基线 {r['base'][0]:.4f} | 决策层 {r['dl'][0]:.4f}")
+    print(f"采用 mask_t={best['mask_t']}")
+    json.dump(dict(mask_t=best["mask_t"], base_pq=best["base"][0], base_seed_t=best["base"][1],
+                   base_min_area=best["base"][2], dl_pq=best["dl"][0], tau=best["dl"][1]),
+              open(os.path.join(args.out_dir, "decision_layer_params.json"), "w"), indent=2)
+
+    if not args.no_submission and args.test_img_dir:
+        for mode in ("match", "same"):
+            write_submission(args, DISK, best, mode)
 
 
 if __name__ == "__main__":
