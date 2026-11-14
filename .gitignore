@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+cache/
+output/
+weights_retrained/
+analysis/out/*.pkl
+check_out/
