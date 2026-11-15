@@ -83,7 +83,7 @@ python -m filament.decision_layer predict --data-root $DATA
   lower peaks than the single-model out-of-fold maps). This uses test images but no test labels.
 - The decision layer follows the public Kaggle notebook *"Deciding under disagreement — a
   PQ-optimal detect-then-refine cascade for solar filaments (filseg v4)"* shared in this
-  competition: the rule *h·m* > PQ/2, the split into a match probability and a conditional IoU,
+  competition (https://www.kaggle.com/code/tushhaaarrrr/solar-filament-segmentation-2026-0-40): the rule *h·m* > PQ/2, the split into a match probability and a conditional IoU,
   and the cross-fitted estimation are taken from it. That solution selects candidates from a
   multi-threshold component tree and adds a detector and a refinement stage; this repository uses
   a single threshold with connected components, its own feature set and the calibration step

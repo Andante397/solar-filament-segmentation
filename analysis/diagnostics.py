@@ -56,11 +56,14 @@ def match_reading(pred_lab, n_pred, gt_masks):
     inside_gt = inter / np.maximum(area_p[None, :], 1) > 0.5       # prediction mostly inside annotation
     covers_gt = inter / np.maximum(area_g[:, None], 1) > 0.5       # annotation mostly inside prediction
 
+    # Annotations of one reading can overlap each other, so two of them may
+    # reach IoU > 0.5 with the same prediction; the better one gets the match.
     matched_pred = np.zeros(n_pred, bool)
-    gts = []
-    for i in range(len(gt_masks)):
+    gts = [None] * len(gt_masks)
+    best = iou.max(axis=1) if n_pred else np.zeros(len(gt_masks))
+    for i in np.argsort(-best, kind="stable"):
         j = int(np.argmax(iou[i])) if n_pred else -1
-        ok = n_pred > 0 and iou[i, j] > 0.5
+        ok = n_pred > 0 and iou[i, j] > 0.5 and not matched_pred[j]
         if ok:
             matched_pred[j] = True
             status = "matched"
@@ -72,9 +75,9 @@ def match_reading(pred_lab, n_pred, gt_masks):
             status = "merged"
         else:
             status = "mislocalised"
-        gts.append(dict(status=status, area=float(area_g[i]),
-                        iou=float(iou[i, j]) if ok else 0.0,
-                        n_fragments=int(inside_gt[i].sum())))
+        gts[i] = dict(status=status, area=float(area_g[i]),
+                      iou=float(iou[i, j]) if ok else 0.0,
+                      n_fragments=int(inside_gt[i].sum()))
     preds = []
     for j in range(n_pred):
         if matched_pred[j]:
@@ -344,7 +347,8 @@ def fig_pipeline(paths, disk, imgs, per_image, emitted, mask_t, path, size=640):
     ax[2].imshow(prob[win], cmap="magma", vmin=0, vmax=255); ax[2].set_title("(c) probability", fontsize=6)
     for a, lab, title in ((ax[3], cand, "(d) candidates"), (ax[4], final, "(e) emitted instances")):
         a.imshow(img[win], cmap="gray", vmin=0, vmax=255)
-        a.imshow(np.ma.masked_equal(lab[win], 0) % 20, cmap="tab20", alpha=0.75, interpolation="nearest")
+        a.imshow(np.ma.masked_equal(lab[win], 0) % 10, cmap="tab10", vmin=0, vmax=9, alpha=0.75,
+                 interpolation="nearest")   # fixed colour scale: same colour in (d) and (e)
         a.set_title(title, fontsize=6)
     for a in ax:
         a.axis("off")
